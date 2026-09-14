@@ -1,0 +1,75 @@
+# GeoWeave end-to-end interleave inference for the geo-aux bench.
+# Each worker process loads one full model onto one GPU (data parallelism);
+# `interleave_gen` produces text + auxiliary-line images in a single call,
+# yielding a predictions.jsonl directly consumable by L1/L2/L3.
+
+inference:
+  # Directly loadable Hugging Face-format GeoWeave checkpoint directory
+  # or model identifier. Override at the CLI with `--model-path`.
+  model_path: ""
+  # Optional LoRA adapter (safetensors). Leave empty / unset for no LoRA.
+  # CLI override: --lora-path <path>  (pass --lora-path "" to disable).
+  lora_path: ""
+
+  # Optional root for relative paths in each sample's `images` list. Resolution
+  # order is: absolute path, path relative to the benchmark JSONL directory,
+  # then path relative to this directory. Leave null for portable datasets that
+  # keep their images next to the benchmark JSONL.
+  image_root: null
+
+  # ── Inter-GPU parallelism (data parallelism) ────────────────────────────
+  # Each worker is one independent engine pinned to one GPU via
+  # CUDA_VISIBLE_DEVICES. Option A takes precedence over Option B.
+  # Option A — explicit GPU IDs:
+  gpus: "0,1,2,3,4,5,6,7" #,1,2,3,4,5,6,7
+  # Option B — count only (uses GPUs 0..N-1):
+  # num_workers: 8
+
+  # ── Engine settings ─────────────────────────────────────────────────────
+  dtype: "bfloat16"            # bfloat16 | float16 | float32
+  attn_backend: "auto"         # auto | flash | sdpa
+  vram_mode: "full"            # full | balanced | low (full = no offload)
+
+  # ── Interleave text-decoding parameters ────────────────────────────────
+  # These are passed through GenerationConfig to interleave_gen().
+  max_new_tokens: 2048
+
+  repetition_penalty: 1.0      # penalize repeated tokens to reduce verbose CoT
+
+  # ── interleave_gen parameters (mirror examples/interleave/inference.py) ─
+  cfg_scale: 4.0
+  img_cfg_scale: 1.0
+  timestep_shift: 3.0
+  cfg_interval: [0.0, 1.0]
+  num_steps: 50
+
+  # 512^2 total-pixel setting (uncomment these two lines and comment out the 1024^2 pair to switch):
+  min_pixels: 262144
+  target_pixels: 262144
+  
+  seed: 42
+
+  # Fallback aspect-ratio bucket when an item has no input image (geo-aux
+  # always has images[0], so this is just a safety net). Must be one of the
+  # buckets in engine.SUPPORTED_RESOLUTIONS.
+  resolution: "16:9"
+
+judge:
+  # Shared process-local judge API request-start rate and sample concurrency.
+  qps: 4
+  workers: 16
+  vision:
+    base_url: "https://your-judge-endpoint.example.com/v1"
+    model: "gemini-3.1-pro-preview"
+    api_key_env: "JUDGE_API_KEY"
+    # gemini-3.x reasoning default burns the whole max_completion_tokens budget
+    # on thought and returns empty content (finish_reason='length'). Cap it.
+    reasoning_effort: "low"
+  text:
+    base_url: "https://your-judge-endpoint.example.com/v1"
+    model: "gemini-3-flash-preview"
+    api_key_env: "JUDGE_API_KEY"
+    reasoning_effort: "low"
+  cache_dir: "./results/judge_cache"
+  request_timeout: 120
+  max_retries: 4

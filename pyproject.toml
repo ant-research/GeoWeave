@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sensenova-u1"
+version = "0.1.0+geoweave"
+description = "GeoWeave self-contained inference and evaluation runtime"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "transformers==4.57.1",
+    "tokenizers==0.22.1",
+    "accelerate==1.10.1",
+    "huggingface-hub==0.36.2",
+    "safetensors==0.6.2",
+    "sentencepiece==0.2.1",
+    "numpy>=1.24,<3",
+    "pillow==12.0.0",
+    "tqdm==4.67.1",
+    "packaging==25.0",
+    "pyyaml>=6",
+    "latex2sympy2",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+flash = ["flash-attn>=2.8,<3"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+sensenova-u1 = "sensenova_u1:main"
+geoweave-infer = "run_inference:main"
+geoweave-eval = "run_eval:main"
+geoweave-eval-answers = "run_eval_ans:main"
+
+[tool.setuptools]
+packages = [
+    "sensenova_u1",
+    "sensenova_u1.models",
+    "sensenova_u1.models.neo_unify",
+    "sensenova_u1.utils",
+    "data",
+    "inference",
+    "inference.u1_interleave",
+    "evaluation",
+    "evaluation.common",
+    "evaluation.level1",
+    "evaluation.level2",
+    "evaluation.level3",
+    "evaluation.level4",
+    "evaluation.level5",
+]
+py-modules = ["run_inference", "run_eval", "run_eval_ans"]
+package-dir = { "sensenova_u1" = "src/sensenova_u1" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }

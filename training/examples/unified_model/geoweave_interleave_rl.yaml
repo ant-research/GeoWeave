@@ -1,0 +1,323 @@
+# @package _global_
+# GeoWeave Interleave-RL training with interleave generation (trainside).
+#
+# Architecture:
+#   - GeoWeave interleaved text↔image generation pipeline
+#   - Interleave-RL on the AR text track only (no image supervision)
+#   - Understanding branch unfrozen, generation branch + fm_modules frozen
+#   - TrainsideRolloutEngine (single-engine, no weight sync)
+#
+# Usage:
+#   python -m unirl.train_unified_model --config-name unified_model/geoweave_interleave_rl
+
+defaults:
+  - _self_
+
+num_devices: 8
+batch_size: 8
+num_rollouts: 1000
+
+# Keep every artifact for one run under a single experiment directory.
+experiment_dir: ${oc.env:EXPERIMENT_DIR,./experiments/${oc.env:RUN_NAME,trainside_grpo}}
+
+stage_config:
+  system_message: ""
+  rollout_text_batch_size: 8
+  # Distinct trajectory jobs are dispatched dynamically to idle DP workers.
+  # Keep backend.fsdp_cfg.reshard_after_forward=false for ragged rollout.
+  dynamic_trajectory_scheduling: true
+  # Candidate chunk size for each dynamic rollout job.
+  dynamic_rollout_chunk_size: 2
+  # Low-risk continuous path: keep a larger local request pool, but only merge
+  # text rows whose conditional/unconditional KV lengths and positions match.
+  continuous_batching: true
+  persistent_worker_session: false
+  continuous_request_admission: false
+  continuous_live_admission: false
+  continuous_prompt_microbundle_size: 1
+  continuous_session_window_size: 8
+  continuous_rollout_pool_size: 4
+  continuous_text_batch_size: 2
+  # Score multiple completed prompt groups concurrently while rollout continues.
+  # Each process scorer also issues up to SCA_JUDGE_MAX_WORKERS candidate calls.
+  dynamic_reward_workers: ${oc.env:DYNAMIC_REWARD_WORKERS,4}
+  # Retry a truncated candidate slot under the same prompt. Disabled here so
+  # max-length non-repetition rows are judged and trained as sampled.
+  retry_truncated_trajectories: false
+  # Optional hard-exclusion mode. If enabled, ignore_truncated_samples requires
+  # reward.truncated_reward=zero; exclude_truncated_from_advantage_stats then
+  # also removes those rows from group normalization. Both stay disabled for
+  # the default keep-and-score truncation policy.
+  ignore_truncated_samples: false
+  exclude_truncated_from_advantage_stats: false
+  # Recover only high-confidence exact repetition loops among max-length rows.
+  # The judge sees the prefix ending at the last complete SCA step; replay keeps
+  # the original packed sequence but masks the repeated tail from policy/KL loss.
+  recover_repetition_truncations: true
+  repetition_min_block_tokens: 16
+  repetition_max_block_tokens: 256
+  repetition_min_repeats: 3
+  repetition_min_prefix_tokens: 64
+  repetition_tail_tolerance_tokens: 32
+  repetition_require_complete_step: true
+  # SCA per-token credit: 2 * outcome_correct - 1 * process_error.
+  sca_outcome_correct_credit: 2.0
+  sca_process_error_penalty: 1.0
+  sca_advantage_eps: 1.0e-6
+  max_attempts_per_candidate: 2
+  max_truncated_refills_per_prompt: 4
+  # Replace all-zero/all-one groups from a driver-side reserve prompt pool.
+  dynamic_prompt_group_refill: true
+  reserve_prompt_count: ${batch_size}
+  max_replacement_prompts: 4
+  max_trajectory_multiplier: 1.5
+weight_sync_interval: 1
+enable_fsdp_offload: false
+save_interval: 100
+save_dir: ${oc.env:SAVE_DIR,${experiment_dir}/checkpoints}
+save_mode: full
+
+# Dump images are snapshotted as CPU uint8, encoded as JPEG in parallel, and
+# written by one bounded background rollout task that is flushed on exit.
+dump_dir: ${oc.env:DUMP_DIR,${experiment_dir}/dumps}
+dump_async: true
+dump_image_workers: 8
+dump_jpeg_quality: 90
+dump_max_pending: 1
+
+logging:
+  backend: ${oc.env:LOGGING_BACKEND,tensorboard}
+  report_to_tensorboard: ${oc.decode:${oc.env:REPORT_TO_TENSORBOARD,true}}
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  logging_dir: ${oc.env:TENSORBOARD_LOG_DIR,${experiment_dir}/runs}
+  project_name: ${oc.env:WANDB_PROJECT,geoweave_interleave_rl}
+  run_name: ${oc.env:RUN_NAME,trainside_grpo}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [geoweave, interleave-rl, interleave]
+  # Record step-end allocator and whole-device usage in TensorBoard without
+  # adding per-boundary console logs. Rising end_memory_allocated_gb indicates
+  # live tensor retention; reserved-only growth is usually allocator caching.
+  memory:
+    enabled: true
+    log_boundaries: false
+
+# ── Model ──
+bundle:
+  _target_: unirl.models.sensenova_u1.bundle.SensenovaU1Bundle.from_config
+  config:
+    _target_: unirl.models.sensenova_u1.config.SensenovaU1PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:SENSENOVA_U1_PATH}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    patch_size: 16
+    merge_size: 2
+    noise_scale: 1.0
+    noise_scale_mode: resolution
+    t_eps: 0.02
+    time_shift_type: standard
+    base_shift: 3.0
+    max_shift: 1.15
+    enable_vit: true
+    # Freeze: train understanding only, freeze generation + fm_modules
+    freeze_und: false
+    freeze_gen: true
+    freeze_fm_modules: true
+    use_lora: false
+
+# ── Pipeline ──
+pipeline:
+  _target_: unirl.models.sensenova_u1.pipeline.SensenovaU1UniPipeline
+  autocast_precision: ${bundle.config.autocast_precision}
+  trajectory_precision: ${bundle.config.trajectory_precision}
+  logprob_precision: ${bundle.config.logprob_precision}
+
+# ── FSDP Backend ──
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false
+    defer_grad_sync: false  # UnifiedModelTrainStack currently requires eager FSDP grad sync
+    # Packed replay exports per-layer K/V as functional tensor outputs, so
+    # checkpoint recompute has no mutable DynamicCache side effects.
+    activation_checkpointing: true
+    use_torch_compile: false
+    # Parallel per-rank checkpoint I/O; avoids the legacy full gather and
+    # single 100+ GB torch.save bottleneck. Legacy checkpoint.pt still loads.
+    checkpoint_format: dcp
+    checkpoint_async: false
+    # embed_tokens / lm_head / norms frozen, sit outside per-block wrap;
+    # vendored code calls them outside a root forward — incompatible with
+    # root fully_shard owning those params.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    # Optimizer-step units, derived from the rollout budget and stack settings.
+    # accumulation>1: ceil(num_rollouts / accumulation); otherwise rollouts*updates.
+    total_steps: ${optimizer_steps:${num_rollouts},${stack.gradient_accumulation_steps},${stack.num_updates_per_batch}}
+
+# ── Rollout Engine ──
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion, ar]
+
+# ── Reward (SCA: outcome correctness + GenPRM process credit) ──
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  overlong_buffer_len: 512
+  overlong_penalty_factor: 1.0
+  backend:
+    _target_: unirl.reward.local.sca_dual_judge.SCADualJudgeRewardScorer
+    outcome_backend:
+      _target_: unirl.reward.local.dashscope_llm_judge.DashScopeLLMJudgeRewardScorer
+      base_device: cpu
+      config:
+        _target_: unirl.reward.local.dashscope_llm_judge.DashScopeLLMJudgeSpec
+        model: ${oc.env:ANSWER_JUDGE_MODEL,qwen3.7-max}
+        api_key_env: DASHSCOPE_API_KEY
+        temperature: ${oc.env:DASHSCOPE_JUDGE_TEMPERATURE,0.0}
+        top_p: ${oc.env:DASHSCOPE_JUDGE_TOP_P,0.7}
+        max_tokens: ${oc.env:DASHSCOPE_JUDGE_MAX_TOKENS,512}
+        enable_thinking: ${oc.env:DASHSCOPE_JUDGE_ENABLE_THINKING,false}
+        timeout: ${oc.env:DASHSCOPE_JUDGE_TIMEOUT,60.0}
+        max_retries: ${oc.env:DASHSCOPE_JUDGE_MAX_RETRIES,2}
+        retry_backoff_s: ${oc.env:DASHSCOPE_JUDGE_RETRY_BACKOFF_S,1.0}
+        max_workers: ${oc.env:DASHSCOPE_JUDGE_MAX_WORKERS,8}
+    process_backend:
+      _target_: unirl.reward.local.sca_genprm.SCAGenPRMRewardScorer
+      base_device: cpu
+      config:
+        _target_: unirl.reward.local.sca_genprm.SCAGenPRMSpec
+        model: ${oc.env:SCA_JUDGE_MODEL,gemini-3.5-flash}
+        api_key_env: API_KEY_ENV
+        base_url: ${oc.env:JUDGE_BASE_URL}
+        temperature: ${oc.env:SCA_JUDGE_TEMPERATURE,0.7}
+        top_p: ${oc.env:SCA_JUDGE_TOP_P,0.9}
+        max_tokens: ${oc.env:SCA_JUDGE_MAX_TOKENS,16384}
+        reasoning_effort: ${oc.env:SCA_JUDGE_REASONING_EFFORT,low}
+        response_format: ${oc.env:SCA_JUDGE_RESPONSE_FORMAT,json_object}
+        num_critiques: ${oc.env:SCA_NUM_CRITIQUES,1}
+        voting: ${oc.env:SCA_VOTING,majority}
+        qps: ${oc.env:SCA_JUDGE_QPS,2.0}
+        timeout: ${oc.env:SCA_JUDGE_TIMEOUT,360.0}
+        max_retries: ${oc.env:SCA_JUDGE_MAX_RETRIES,2}
+        max_workers: ${oc.env:SCA_JUDGE_MAX_WORKERS,8}
+        keep_raw_outputs: ${oc.env:SCA_KEEP_RAW_OUTPUTS,false}
+
+# ── Algorithms ──
+algorithm:
+  ar:
+    _target_: unirl.algorithms.interleave_rl.InterleaveRL
+    stage_attr: ar
+    clip_range: 0.2
+    # DAPO clip-higher upper epsilon. null keeps symmetric clipping.
+    clip_range_high: null
+    # Exact full-vocabulary policy entropy; 0 disables. Logged every N optimizer steps.
+    policy_entropy_interval: 10
+    clip_schedule: constant
+    loss_agg_mode: token-mean
+    horizon: 2560
+    sampling_temperature: ${sampling.ar.temperature}
+    # Sampled-token k3 KL(policy || pretrained reference); 0 disables ref AR replay.
+    ar_kl_coef: 0.0
+    mse_weight: 1.5e-5
+    mse_steps: ${sampling.diffusion.scheduler.num_sde_steps}
+    # Keep ragged rollout on ZeRO-2. This optional switch enables post-forward
+    # resharding only during packed replay/backward, then restores rollout mode.
+    train_reshard_after_forward: false
+    diffusion_stage_attr: diffusion
+    diffusion_params: ${sampling.diffusion}
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.sensenova_u1.conditions.SensenovaU1ARConditions
+  image: null
+
+# ── Train Stack ──
+stack:
+  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # Cross-rollout accumulation. Values >1 require num_updates_per_batch=1
+  # and fixed per-track presence/batch size throughout each window;
+  # num_rollouts remains the rollout/data budget. When enabled (>1),
+  # scheduler total_steps counts ceil(num_rollouts / this value) optimizer steps.
+  gradient_accumulation_steps: 4
+  num_updates_per_batch: 1
+
+# ── Data Source ──
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,./datasets/prompts.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,null}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# ── Sampling ──
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 8
+    temperature: 1.0
+    top_p: 0.6
+    top_k: 0
+    max_new_tokens: 2560
+  diffusion:
+    _target_: unirl.models.sensenova_u1.diffusion.SensenovaU1DiffusionParams
+    samples_per_prompt: 1
+    num_inference_steps: 30
+    # Text-only CFG matching inference defaults: drop text while preserving
+    # input/generated images. Inline velocity MSE remains conditional-only.
+    guidance_scale: 4.0
+    height: 512
+    width: 512
+    max_images: 3
+    rollout_diffusion_batch_size: 2
+    rollout_reencode_batch_size: 2
+    eta: 0.8
+    t_eps: 0.02
+    noise_scale: 1.0
+    noise_scale_mode: resolution
+    timestep_shift: 1.0
+    cfg_norm: none
+    cfg_interval: [0.0, 1.0]
+    seed: 42
+    # false: each candidate gets independent x_T; true: candidates under the
+    # same prompt share x_T for the corresponding generated-image index.
+    init_same_noise: true
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    # SDE window: 3 steps in the early/high-noise region for future image RL.
+    # Currently algorithm.image=null so SDE log-probs are recorded but unused.
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      timestep_fraction: [0.0, 0.2]
+      num_sde_steps: 3
+
+# Hydra's resolved config and own log stay with the same experiment.
+hydra:
+  run:
+    dir: ${oc.env:HYDRA_OUTPUT_DIR,${experiment_dir}/outputs}

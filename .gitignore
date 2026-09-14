@@ -1,0 +1,38 @@
+# Virtual environments
+.venv/
+training/.venv-RL/
+
+# Python caches and build products
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.so
+.pytest_cache/
+.ruff_cache/
+
+# Model weights and large outputs
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+results/
+
+# Local configuration and secrets
+.env
+.env.local
+configs/*.local.yaml
+configs/secrets.yaml
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local agent settings
+.claude/
+.claude/settings.local.json
+.codex/
+

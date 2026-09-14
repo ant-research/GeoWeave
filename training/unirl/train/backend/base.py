@@ -1,0 +1,67 @@
+"""Backend-agnostic schema dataclasses for the training stack.
+
+Config-layer schemas (torch-free — shared by every train backend):
+
+* :class:`OptimizerConfig` — AdamW hyperparameters
+* :class:`LrSchedulerConfig` — LR schedule hyperparameters
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+
+@dataclass
+class OptimizerConfig:
+    """AdamW-style optimizer hyperparameters consumed by the training actor."""
+
+    learning_rate: float
+    adam_beta1: float
+    adam_beta2: float
+    adam_epsilon: float
+    weight_decay: float
+    # Optional per-param-group learning rates: maps a parameter-NAME substring to
+    # an LR. A trainable param whose name contains a key gets that LR (first match
+    # wins); the rest use ``learning_rate``. ``None`` (default) => a single LR over
+    # all trainable params (unchanged). Used e.g. for BAGEL MoT UniGRPO, where the
+    # text (und) experts and image (gen, "moe_gen") experts train at different LRs
+    # within one shared optimizer step.
+    param_group_lrs: Optional[Dict[str, float]] = None
+
+
+@dataclass
+class LrSchedulerConfig:
+    """Learning-rate scheduler hyperparameters."""
+
+    type: str
+    warmup_steps: int
+    total_steps: int
+
+
+def resolve_trainable_module(bundle: object, trainable_attr: str):
+    """The module a backend wraps + optimizes + checkpoints.
+
+    A bundle may expose ``trainable_module()`` to hand the backend a *nested*
+    submodule (e.g. hunyuan_image3's bare decoder ``transformer.model``). The
+    backend then shards / optimizes / checkpoints exactly that trainable subtree,
+    and the composite's frozen aux (diffusion heads, VAE, ViT) stays *outside*
+    the wrap — on meta until the bundle materializes it, and out of the
+    optimizer / checkpoint scope. Crucially this is what lets the composite run
+    under VeOmni, whose ``parallelize`` root-shards + whole-root-``to_empty``s
+    whatever module it is given (a heterogeneous composite is out of scope, a
+    single decoder is not).
+
+    Bundles that do not expose ``trainable_module()`` fall back to the named
+    attribute (the common single-module case), so existing recipes are
+    unaffected.
+    """
+    tm = getattr(bundle, "trainable_module", None)
+    return tm() if callable(tm) else getattr(bundle, trainable_attr)
+
+
+__all__ = [
+    "LrSchedulerConfig",
+    "OptimizerConfig",
+    "resolve_trainable_module",
+]
