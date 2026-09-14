@@ -10,7 +10,7 @@ Chain-of-Thought for Geometry Problem Solving*](https://arxiv.org/pdf/2609.12606
 | GeoWeave-8B weights | [Model weights](https://huggingface.co/AntResearch/GeoWeave) |
 | GeoVAD-Bench data | [Benchmark](https://huggingface.co/AntResearch/GeoWeave) |
 
-![GeoWeave results](assets/results_radial_comparison.png).
+![GeoWeave results](assets/results_radial_comparison.png)
 
 ## Overview
 
